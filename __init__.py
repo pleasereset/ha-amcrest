@@ -55,11 +55,13 @@ CONF_RESOLUTION = "resolution"
 CONF_STREAM_SOURCE = "stream_source"
 CONF_FFMPEG_ARGUMENTS = "ffmpeg_arguments"
 CONF_CONTROL_LIGHT = "control_light"
+CONF_CHANNEL = "channel"
 
 DEFAULT_NAME = "Amcrest Camera"
 DEFAULT_PORT = 80
 DEFAULT_RESOLUTION = "high"
 DEFAULT_ARGUMENTS = "-pred 1"
+DEFAULT_CHANNEL = 1
 MAX_ERRORS = 5
 RECHECK_INTERVAL = timedelta(minutes=1)
 
@@ -71,6 +73,8 @@ RESOLUTION_LIST = {"high": 0, "low": 1}
 SCAN_INTERVAL = timedelta(seconds=10)
 
 AUTHENTICATION_LIST = {"basic": "basic"}
+
+CHANNELS_HAPPENED_RESULT_PREFIX = "channels[0]="
 
 
 def _has_unique_names(devices):
@@ -104,6 +108,7 @@ AMCREST_SCHEMA = vol.Schema(
             cv.ensure_list, [vol.In(SENSORS)], vol.Unique()
         ),
         vol.Optional(CONF_CONTROL_LIGHT, default=True): cv.boolean,
+        vol.Optional(CONF_CHANNEL, default=DEFAULT_CHANNEL): cv.positive_int,
     }
 )
 
@@ -197,26 +202,34 @@ class AmcrestChecker(Http):
             pass
 
 
-def _monitor_events(hass, name, api, event_codes):
+def _monitor_events(hass, name, api, event_codes, channel):
     event_codes = ",".join(event_codes)
     while True:
         api.available_flag.wait()
         try:
             for code, start in api.event_actions(event_codes, retries=5):
-                signal = service_signal(SERVICE_EVENT, name, code)
-                _LOGGER.debug("Sending signal: '%s': %s", signal, start)
-                dispatcher_send(hass, signal, start)
+                # checking on which channel the event occured
+                # and dispatching only if the event occured on the current channel
+                channel_result = api.event_channels_happened(code)
+                if channel_result.startswith(CHANNELS_HAPPENED_RESULT_PREFIX):
+                    # the API result is 0-based, with channels from configuration are 1-based
+                    occured_on = 1 + int(channel_result[len(CHANNELS_HAPPENED_RESULT_PREFIX):])
+                    _LOGGER.debug("Event occured on channel: %d. This event monitors channel: %d", occured_on, channel)
+                    if (occured_on == channel):
+                        signal = service_signal(SERVICE_EVENT, name, code)
+                        _LOGGER.debug("Sending signal: '%s': %s", signal, start)
+                        dispatcher_send(hass, signal, start)
         except AmcrestError as error:
             _LOGGER.warning(
                 "Error while processing events from %s camera: %r", name, error
             )
 
 
-def _start_event_monitor(hass, name, api, event_codes):
+def _start_event_monitor(hass, name, api, event_codes, channel):
     thread = threading.Thread(
         target=_monitor_events,
         name=f"Amcrest {name}",
-        args=(hass, name, api, event_codes),
+        args=(hass, name, api, event_codes, channel),
         daemon=True,
     )
     thread.start()
@@ -230,6 +243,7 @@ def setup(hass, config):
         name = device[CONF_NAME]
         username = device[CONF_USERNAME]
         password = device[CONF_PASSWORD]
+        channel = device[CONF_CHANNEL]
 
         api = AmcrestChecker(
             hass, name, device[CONF_HOST], device[CONF_PORT], username, password
@@ -256,6 +270,7 @@ def setup(hass, config):
             stream_source,
             resolution,
             control_light,
+            channel
         )
 
         discovery.load_platform(hass, CAMERA, DOMAIN, {CONF_NAME: name}, config)
@@ -274,7 +289,7 @@ def setup(hass, config):
                 if sensor_type not in BINARY_POLLED_SENSORS
             ]
             if event_codes:
-                _start_event_monitor(hass, name, api, event_codes)
+                _start_event_monitor(hass, name, api, event_codes, channel)
 
         if sensors:
             discovery.load_platform(
@@ -342,6 +357,7 @@ class AmcrestDevice:
         stream_source,
         resolution,
         control_light,
+        channel,
     ):
         """Initialize the entity."""
         self.api = api
@@ -350,3 +366,4 @@ class AmcrestDevice:
         self.stream_source = stream_source
         self.resolution = resolution
         self.control_light = control_light
+        self.channel = channel

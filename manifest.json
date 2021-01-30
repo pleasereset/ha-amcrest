@@ -1,5 +1,5 @@
 {
-  "domain": "amcrest",
+  "domain": "amcrestdev",
   "name": "Amcrest",
   "documentation": "https://www.home-assistant.io/integrations/amcrest",
   "requirements": ["amcrest==1.7.0"],

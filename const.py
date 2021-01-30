@@ -1,5 +1,5 @@
 """Constants for amcrest component."""
-DOMAIN = "amcrest"
+DOMAIN = "amcrestdev"
 DATA_AMCREST = DOMAIN
 CAMERAS = "cameras"
 DEVICES = "devices"
@@ -10,6 +10,11 @@ COMM_RETRIES = 1
 COMM_TIMEOUT = 6.05
 SENSOR_SCAN_INTERVAL_SECS = 10
 SNAPSHOT_TIMEOUT = 20
+
+EVENT_ACTION_START = "Start"
+EVENT_ACTION_STOP = "Stop"
+EVENT_KEY_ACTION = "action"
+EVENT_KEY_CODE = "Code"
 
 SERVICE_EVENT = "event"
 SERVICE_UPDATE = "update"

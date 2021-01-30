@@ -46,6 +46,7 @@ from .const import (
     SERVICE_EVENT,
     SERVICE_UPDATE,
 )
+from .event_monitor import EventMonitor
 from .helpers import service_signal
 from .sensor import SENSORS
 
@@ -74,14 +75,10 @@ SCAN_INTERVAL = timedelta(seconds=10)
 
 AUTHENTICATION_LIST = {"basic": "basic"}
 
-CHANNELS_HAPPENED_RESULT_PREFIX = "channels[0]="
-
-
 def _has_unique_names(devices):
     names = [device[CONF_NAME] for device in devices]
     vol.Schema(vol.Unique())(names)
     return devices
-
 
 AMCREST_SCHEMA = vol.Schema(
     {
@@ -90,6 +87,7 @@ AMCREST_SCHEMA = vol.Schema(
         vol.Required(CONF_PASSWORD): cv.string,
         vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
         vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
+        vol.Optional(CONF_CHANNEL, default=DEFAULT_CHANNEL): cv.positive_int,
         vol.Optional(CONF_AUTHENTICATION, default=HTTP_BASIC_AUTHENTICATION): vol.All(
             vol.In(AUTHENTICATION_LIST)
         ),
@@ -108,7 +106,6 @@ AMCREST_SCHEMA = vol.Schema(
             cv.ensure_list, [vol.In(SENSORS)], vol.Unique()
         ),
         vol.Optional(CONF_CONTROL_LIGHT, default=True): cv.boolean,
-        vol.Optional(CONF_CHANNEL, default=DEFAULT_CHANNEL): cv.positive_int,
     }
 )
 
@@ -116,15 +113,54 @@ CONFIG_SCHEMA = vol.Schema(
     {DOMAIN: vol.All(cv.ensure_list, [AMCREST_SCHEMA], _has_unique_names)},
     extra=vol.ALLOW_EXTRA,
 )
-
-
+    
 class AmcrestChecker(Http):
     """amcrest.Http wrapper for catching errors."""
+    _instance_cache = dict()
+    _instance_cache_lock = threading.Lock()
 
-    def __init__(self, hass, name, host, port, user, password):
+    @staticmethod
+    def get(hass, host, port, user, password, name, channel):
+        """Returns the same AmcrestChecker object for a given endpoint, so an
+        endpoint hosting several cameras doesn't generate duplicate API 
+        objects"""
+        class CacheKey:
+            def __init__(self, host, port, user, password):
+                self.host = host
+                self.port = port
+                self.user = user
+                self.password = password
+
+            def __hash__(self):
+                return hash((self.host, self.port, self.user, self.password))
+            
+            def __eq__(self, other):
+                return self.host == other.host and \
+                    self.port == other.port and self.user == other.user \
+                    and self.password == other.password
+
+        cache_key = CacheKey(host, port, user, password)
+        with AmcrestChecker._instance_cache_lock:
+            if cache_key not in AmcrestChecker._instance_cache:
+                _LOGGER.debug(
+                    "No previously created API object found for host '%s', " \
+                    + "creating a new instance for '%s'.", host, name)
+                AmcrestChecker._instance_cache[cache_key] = AmcrestChecker(
+                    hass, host, port, user, password, name, channel
+                )
+            else:
+                _LOGGER.debug("Found an existing API instance for host '%s', " \
+                    + "registering '%s' to it.", host, name)
+                AmcrestChecker._instance_cache[cache_key].add_channel(
+                    name, channel
+                )
+            return AmcrestChecker._instance_cache[cache_key]
+
+    def __init__(self, hass, host, port, user, password, name, channel):
         """Initialize."""
+        self._event_monitor = None
         self._hass = hass
-        self._wrap_name = name
+        self._wrap_channel_map = { channel: name }
         self._wrap_errors = 0
         self._wrap_lock = threading.Lock()
         self._wrap_login_err = False
@@ -147,12 +183,22 @@ class AmcrestChecker(Http):
 
     @property
     def available_flag(self):
-        """Return threading event flag that indicates if camera's API is responding."""
+        """Return threading event flag that indicates if camera's API is 
+        responding."""
         return self._wrap_event_flag
+
+    @property
+    def serviced_names(self):
+        """Returns the list of services (camera) names handled by this 
+        instance"""
+        return self._wrap_channel_map.values()
 
     def _start_recovery(self):
         self._wrap_event_flag.clear()
-        dispatcher_send(self._hass, service_signal(SERVICE_UPDATE, self._wrap_name))
+        for service_name in self.serviced_names:
+            dispatcher_send(self._hass, service_signal(
+                SERVICE_UPDATE, service_name
+            ))
         self._unsub_recheck = track_time_interval(
             self._hass, self._wrap_test_online, RECHECK_INTERVAL
         )
@@ -167,7 +213,10 @@ class AmcrestChecker(Http):
                 was_login_err = self._wrap_login_err
                 self._wrap_login_err = True
             if not was_login_err:
-                _LOGGER.error("%s camera offline: Login error: %s", self._wrap_name, ex)
+                _LOGGER.error(
+                    "Camera endpoint '%s' offline: Login error: %s",
+                    self._host, ex
+                )
             if was_online:
                 self._start_recovery()
             raise
@@ -176,9 +225,11 @@ class AmcrestChecker(Http):
                 was_online = self.available
                 errs = self._wrap_errors = self._wrap_errors + 1
                 offline = not self.available
-            _LOGGER.debug("%s camera errs: %i", self._wrap_name, errs)
+            _LOGGER.debug("%s camera errs: %i", self._host, errs)
             if was_online and offline:
-                _LOGGER.error("%s camera offline: Too many errors", self._wrap_name)
+                _LOGGER.error(
+                    "Camera endpoint '%s' offline: Too many errors", self._host
+                )
                 self._start_recovery()
             raise
         with self._wrap_lock:
@@ -188,52 +239,32 @@ class AmcrestChecker(Http):
         if was_offline:
             self._unsub_recheck()
             self._unsub_recheck = None
-            _LOGGER.error("%s camera back online", self._wrap_name)
+            _LOGGER.error("Camera endpoint '%s' back online", self._host)
             self._wrap_event_flag.set()
-            dispatcher_send(self._hass, service_signal(SERVICE_UPDATE, self._wrap_name))
+            for service_name in self.serviced_names:
+                dispatcher_send(self._hass, service_signal(SERVICE_UPDATE, service_name))
         return ret
+
+    def add_channel(self, name, channel):
+        with self._wrap_lock:
+            self._wrap_channel_map[channel] = name
 
     def _wrap_test_online(self, now):
         """Test if camera is back online."""
-        _LOGGER.debug("Testing if %s back online", self._wrap_name)
+        _LOGGER.debug("Testing if '%s' is back online...", self._host)
         try:
             self.current_time
         except AmcrestError:
             pass
 
-
-def _monitor_events(hass, name, api, event_codes, channel):
-    event_codes = ",".join(event_codes)
-    while True:
-        api.available_flag.wait()
-        try:
-            for code, start in api.event_actions(event_codes, retries=5):
-                # checking on which channel the event occured
-                # and dispatching only if the event occured on the current channel
-                channel_result = api.event_channels_happened(code)
-                if channel_result.startswith(CHANNELS_HAPPENED_RESULT_PREFIX):
-                    # the API result is 0-based, with channels from configuration are 1-based
-                    occured_on = 1 + int(channel_result[len(CHANNELS_HAPPENED_RESULT_PREFIX):])
-                    _LOGGER.debug("Event occured on channel: %d. This event monitors channel: %d", occured_on, channel)
-                    if (occured_on == channel):
-                        signal = service_signal(SERVICE_EVENT, name, code)
-                        _LOGGER.debug("Sending signal: '%s': %s", signal, start)
-                        dispatcher_send(hass, signal, start)
-        except AmcrestError as error:
-            _LOGGER.warning(
-                "Error while processing events from %s camera: %r", name, error
+    def start_monitoring_events(self, event_codes, channel):
+        name = self._wrap_channel_map[channel]
+        if self._event_monitor:
+            self._event_monitor.monitor_events(event_codes, channel, name)
+        else:
+            self._event_monitor = EventMonitor(
+                self._hass, self, event_codes, channel, name
             )
-
-
-def _start_event_monitor(hass, name, api, event_codes, channel):
-    thread = threading.Thread(
-        target=_monitor_events,
-        name=f"Amcrest {name}",
-        args=(hass, name, api, event_codes, channel),
-        daemon=True,
-    )
-    thread.start()
-
 
 def setup(hass, config):
     """Set up the Amcrest IP Camera component."""
@@ -245,8 +276,9 @@ def setup(hass, config):
         password = device[CONF_PASSWORD]
         channel = device[CONF_CHANNEL]
 
-        api = AmcrestChecker(
-            hass, name, device[CONF_HOST], device[CONF_PORT], username, password
+        api = AmcrestChecker.get(
+            hass, device[CONF_HOST], device[CONF_PORT], username, password, 
+            name, channel
         )
 
         ffmpeg_arguments = device[CONF_FFMPEG_ARGUMENTS]
@@ -289,7 +321,7 @@ def setup(hass, config):
                 if sensor_type not in BINARY_POLLED_SENSORS
             ]
             if event_codes:
-                _start_event_monitor(hass, name, api, event_codes, channel)
+                api.start_monitoring_events(event_codes, channel)
 
         if sensors:
             discovery.load_platform(
